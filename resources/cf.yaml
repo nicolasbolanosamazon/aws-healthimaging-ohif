@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  This CloudFormation template creates the underlying infrastructure
+  to support the OHIF Viewer with AWS HealthImaging.
+Resources:
+  IAMUserReadOnlyHealthImaging:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub user-ohif-healthimaging-readonly-${AWS::AccountId}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSHealthImagingReadOnlyAccess
+  IAMUserReadOnlyHealthImagingAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref IAMUserReadOnlyHealthImaging
+  AWSServiceRoleForApplicationAutoScaling_ECSService:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub aws-service-role-for-application-autoscaling-ecs-service-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/aws-service-role/AWSApplicationAutoscalingECSServicePolicy
+  OhifProxyTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ohif-proxy-task-execution-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSHealthImagingReadOnlyAccess
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ohif-ecs-execution-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  OHIFContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ohif-container-security-group
+      GroupDescription: OHIF Container Security Group
+      VpcId: !ImportValue ohif-vpc-id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8089
+          ToPort: 8089
+          SourceSecurityGroupId: !Ref OHIFApplicationLoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8089
+          ToPort: 8089
+          CidrIp: 0.0.0.0/0
+  OHIFApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ohif-application-load-balancer-security-group
+      GroupDescription: OHIF Application Load Balancer Security Group
+      VpcId: !ImportValue ohif-vpc-id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  S3HealthImagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ohif-healthimaging-data-${AWS::AccountId}
+  S3HostingOHIFBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ohif-viewer-hosting-${AWS::AccountId}
+  CloudFrontResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ohif-viewer-hosting-${AWS::AccountId}
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Override: true 
+          FrameOptions:
+            FrameOption: SAMEORIGIN
+            Override: true
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: default-src 'none'; img-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Cache-Control
+              Value: "no-cache"
+            - Header: Cross-Origin-Opener-Policy
+              Value: "same-origin"
+            - Header: Cross-Origin-Embedder-Policy
+              Value: "require-corp"
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub ohif-viewer-hosting-${AWS::AccountId}.s3.amazonaws.com
+            Id: S3-ohif-viewer-hosting
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        Enabled: "true"
+        Comment: CloudFront Distribution pointing to S3 bucket
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3-ohif-viewer-hosting
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - POST
+          ForwardedValues:
+            QueryString: "false"
+            Cookies:
+              Forward: none
+          ResponseHeadersPolicyId: !GetAtt CloudFrontResponseHeadersPolicy.Id
+  S3HostingOHIFBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3HostingOHIFBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${S3HostingOHIFBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !GetAtt CloudFrontDistribution.Arn
+  OHIFProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ohif-proxy-target-group
+      VpcId: !ImportValue ohif-vpc-id
+      TargetType: ip
+      Port: 80
+      Protocol: HTTP
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "404"
+  OHIFProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OHIFProxyTargetGroup
+      LoadBalancerArn: !Ref OHIFProxyLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  OHIFProxyAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 6
+      MinCapacity: 1
+      ResourceId: !GetAtt OHIFProxyECSService.id
+      RoleARN: !GetAtt AWSServiceRoleForApplicationAutoScaling_ECSService.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  OHIFProxyAutoSclaingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ohif-proxy-auto-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ResourceId: !GetAtt OHIFProxyECSService.id
+      ScalingTargetId: !Ref OHIFProxyAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 300
+        TargetValue: 0.7
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  OHIFProxyLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ohif-proxy-load-balancer
+      Type: application
+      Subnets:
+        - !ImportValue ohif-public-subnet-1-id
+        - !ImportValue ohif-public-subnet-2-id
+      SecurityGroups:
+        - !Ref OHIFApplicationLoadBalancerSecurityGroup
+  OhifProxyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "512"
+      Memory: "3072"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt ECSExecutionRole
+      TaskRoleArn: : !GetAtt OhifProxyTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: ohif-proxy
+          Image: flexview/ohif-healthlake-proxy:latest
+          PortMappings:
+            - Name: ohif-proxy-8089-tcp
+              ContainerPort: 8089
+              HostPort: 8089
+              Protocol: tcp
+              AppProtocol: http
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: "ecs/OHIF-Proxy"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref IAMUserReadOnlyHealthImagingAccessKey
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !GetAtt IAMUserReadOnlyHealthImagingAccessKey.SecretAccessKey
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+  OHIFProxyECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: OHIF-Proxy-ECS-Cluster
+  OHIFProxyECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref OHIF-Proxy-ECS-Cluster
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: 0
+          Weight: 1
+      TaskDefinition: !Ref OhifProxyTaskDefinition
+      ServiceName: ohif-proxy-ecs-service
+      SchedulingStrategy: REPLICA
+      LaunchType: FARGATE
+      DesiredCount: 1
+      LoadBalancers:
+        - ContainerName: ohif-proxy
+          ContainerPort: 8089
+          TargetGroupArn: !Ref OHIFProxyTargetGroup
+          LoadBalancerName: !Ref AWS::NoValue
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref OHIFServiceSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
